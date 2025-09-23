@@ -39,8 +39,8 @@ SILENCE_S     = 0.60
 MAX_UTT_S     = 8.00
 MIN_SPEECH_S  = 0.18
 
-PROMPT = ("You are Laughbot. Reply with ONE short, clean, clever line.No lists, no bullets, no emojis, no quotes, no meta commentary "
-          "You interact with the user based on their input by returning funny one-liners, dad jokes, and anythign else funny. "
+PROMPT = ("You are Laughbot, you are a bot replacement for Rodney Dangerfield. Reply with ONE short, clean, clever line.No lists, no bullets, no emojis, no quotes, no meta commentary "
+          "You interact with the user based on their input by returning funny one-liners, dad jokes, and anything else funny. "
           "No pretext, no follow up. No need for fancy build up, just reply with some funny, entertaining jokes or zings based on input, or not if the input is not coherent.")
 
 # ── mic binding (single source of truth) ───────────────────────────────────────
@@ -253,42 +253,59 @@ def _parse_move_led_overrides(text:str):
     md, ml = m.group(1).lower(), m.group(2).lower()
     return md, (ml=="on")
 
+
+MOVE_N = 0  # in-process alternation counter
+
 def apply_plan(plan: dict):
+    """
+    Firmware grammar:
+      EMO:<NAME>               (HAPPY | EXCITED | SLEEPY | CONFUSED)
+      MOVE:<dir>:<speed>:<ms>  dir = F,B,L,R,S
+    Alternate R (CW) <-> L (CCW). "home" does a short L then R wiggle.
+    Supports env KINDERBOT_SPEED (0..255), KINDERBOT_TURN_MS, and KINDERBOT_SWAP_DIR=1 to flip L/R globally.
+    """
+    import json, os, re
     global MOVE_N
+
     say = (plan.get("say","") or "").strip()
-    # Allow LLM to override direction/LED if present
-    dir_override, led_override = _parse_move_led_overrides(say)
-    if dir_override == "home":
-        home_wiggle=True; direction="ccw"  # first half of wiggle is CCW
+    m = re.search(r'\[MOVE\s+(cw|ccw|home)\]', say, re.I)
+    want = (m.group(1).lower() if m else None)
+
+    SPEED = int(os.getenv("KINDERBOT_SPEED","200"))
+    DURMS = int(os.getenv("KINDERBOT_TURN_MS","600"))
+    SWAP  = os.getenv("KINDERBOT_SWAP_DIR","0").lower() in ("1","true","yes","on")
+
+    if want == "home":
+        seq = [("L", 200), ("R", 200)]
     else:
-        home_wiggle = False
-        direction = dir_override if dir_override in ("cw","ccw") else ("ccw" if (MOVE_N % 2)==1 else "cw")
+        ccw = (MOVE_N % 2) == 1 if want is None else (want == "ccw")
+        seq = [("L" if ccw else "R", DURMS)]
 
-    led_on, turn, led_off = _build_bundles(direction, home_wiggle)
-    print(f"[motion] n={MOVE_N} dir={direction.upper()} | preview: {turn[:4]} ...")
+    if SWAP:
+        seq = [("R" if d=="L" else "L" if d=="R" else d, ms) for d,ms in seq]
 
-    # Batch: LED ON -> TURN -> LED OFF (separate writes so MCU doesn't miss LED tokens)
-    if led_override is None or led_override is True:
-        send_serial(led_on)
-    send_serial(turn)
-    if led_override is None or led_override is True:
-        send_serial(led_off)
+    # LEDs via emotions
+    cmds = ["EMO:EXCITED"] + [f"MOVE:{d}:{SPEED}:{ms}" for d,ms in seq] + ["EMO:CONFUSED"]
+    print(f"[motion] n={MOVE_N} seq={seq} speed={SPEED} swap={SWAP}")
+    send_serial(cmds)
 
     MOVE_N += 1
     try: json.dump({"n": MOVE_N}, open("/tmp/kb_motion_state.json","w"))
     except Exception: pass
 
-# ── self-test ──────────────────────────────────────────────────────────────────
+
 def _kb_selftest():
     try:
-        print("[boot] self-test: motion+LED ping")
-        send_serial(_dualize(["LED ON","EMO:PLAY"]))
-        send_serial(_dualize(["SPIN 120","SPIN_CCW 120"]))
-        send_serial(_dualize(["LED OFF"]))
+        import os
+        SWAP  = os.getenv("KINDERBOT_SWAP_DIR","0").lower() in ("1","true","yes","on")
+        cw  = "L" if SWAP else "R"
+        ccw = "R" if SWAP else "L"
+        print("[boot] self-test: EMO + CW then CCW (swap=" + str(SWAP) + ")")
+        send_serial(["EMO:EXCITED", f"MOVE:{cw}:180:350"])
+        send_serial([f"MOVE:{ccw}:180:350", "EMO:CONFUSED"])
     except Exception as e:
         print("[boot warn]", e)
 
-# ── main loop ──────────────────────────────────────────────────────────────────
 def main():
     print("Kinderbot party mode. Ctrl+C to exit.")
     while True:
