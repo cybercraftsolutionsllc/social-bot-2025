@@ -177,16 +177,28 @@ def plan_action(user_text:str)->dict:
 
 # ── TTS ────────────────────────────────────────────────────────────────────────
 def say_espeak(text):
-    try: subprocess.run(["espeak-ng","-s","165","-p","45",text], check=False)
-    except Exception as e: print("[espeak warn]", e)
+    try:
+        import os, shlex, subprocess
+        dev = os.getenv("KINDERBOT_SPKR","")
+        if dev:
+            # render to stdout and send to ALSA device explicitly
+            cmd = f'espeak-ng -s 165 -p 45 --stdout {shlex.quote(text)} | aplay -q -D {shlex.quote(dev)}'
+            subprocess.run(cmd, shell=True, check=False)
+        else:
+            subprocess.run(["espeak-ng","-s","165","-p","45",text], check=False)
+    except Exception as e:
+        print("[espeak warn]", e)
 
 def say_openai(text, outfile="tts.mp3", voice=OPENAI_VOICE):
     try:
+        import os
+        dev = os.getenv("KINDERBOT_SPKR","")
         with client.audio.speech.with_streaming_response.create(
             model="gpt-4o-mini-tts", voice=voice, input=text
         ) as resp:
             resp.stream_to_file(outfile)
-        subprocess.run(["mpg123","-q",outfile], check=False)
+        cmd = ["mpg123","-q"] + (["-a", dev] if dev else []) + [outfile]
+        subprocess.run(cmd, check=False)
     except Exception as e:
         print("[tts err]", e); say_espeak(text)
 
@@ -256,43 +268,49 @@ def _parse_move_led_overrides(text:str):
 
 MOVE_N = 0  # in-process alternation counter
 
+
+
 def apply_plan(plan: dict):
     """
-    Firmware grammar:
-      EMO:<NAME>               (HAPPY | EXCITED | SLEEPY | CONFUSED)
-      MOVE:<dir>:<speed>:<ms>  dir = F,B,L,R,S
-    Alternate R (CW) <-> L (CCW). "home" does a short L then R wiggle.
-    Supports env KINDERBOT_SPEED (0..255), KINDERBOT_TURN_MS, and KINDERBOT_SWAP_DIR=1 to flip L/R globally.
+    LED blink + visible move:
+      - Blink: EXCITED, pause, CONFUSED, pause, EXCITED
+      - Path:  FWD(long) -> LEFT(turn) -> BACK(almost long)
+      - Coda:  CONFUSED
+    Uses firmware grammar only: EMO:<NAME>, MOVE:<dir>:<speed>:<ms>
+    Tunable via ENV:
+      KINDERBOT_SPEED (default 200)
+      KINDERBOT_MS_FWD (default 700)
+      KINDERBOT_MS_TURN (default 350)
+      KINDERBOT_MS_BACK (default 620)
+      KINDERBOT_MS_BLINK (default 180)   # pause duration for LED blinks
     """
-    import json, os, re
-    global MOVE_N
-
-    say = (plan.get("say","") or "").strip()
-    m = re.search(r'\[MOVE\s+(cw|ccw|home)\]', say, re.I)
-    want = (m.group(1).lower() if m else None)
-
+    import os, json
     SPEED = int(os.getenv("KINDERBOT_SPEED","200"))
-    DURMS = int(os.getenv("KINDERBOT_TURN_MS","600"))
-    SWAP  = os.getenv("KINDERBOT_SWAP_DIR","0").lower() in ("1","true","yes","on")
+    MS_F  = int(os.getenv("KINDERBOT_MS_FWD","700"))
+    MS_T  = int(os.getenv("KINDERBOT_MS_TURN","350"))
+    MS_B  = int(os.getenv("KINDERBOT_MS_BACK","620"))
+    MS_BL = int(os.getenv("KINDERBOT_MS_BLINK","180"))
 
-    if want == "home":
-        seq = [("L", 200), ("R", 200)]
-    else:
-        ccw = (MOVE_N % 2) == 1 if want is None else (want == "ccw")
-        seq = [("L" if ccw else "R", DURMS)]
+    cmds = [
+        # LED pre-blink (create pauses using MOVE:S:0:<ms>)
+        "EMO:EXCITED",           f"MOVE:S:0:{MS_BL}",
+        "EMO:CONFUSED",          f"MOVE:S:0:{MS_BL}",
+        "EMO:EXCITED",
 
-    if SWAP:
-        seq = [("R" if d=="L" else "L" if d=="R" else d, ms) for d,ms in seq]
+        # Visible motion (step out & return with rotation)
+        f"MOVE:F:{SPEED}:{MS_F}",
+        f"MOVE:L:{SPEED}:{MS_T}",
+        f"MOVE:B:{SPEED}:{MS_B}",
 
-    # LEDs via emotions
-    cmds = ["EMO:EXCITED"] + [f"MOVE:{d}:{SPEED}:{ms}" for d,ms in seq] + ["EMO:CONFUSED"]
-    print(f"[motion] n={MOVE_N} seq={seq} speed={SPEED} swap={SWAP}")
+        # LED coda
+        "EMO:CONFUSED"
+    ]
+
+    print(f"[motion] step-out F:{MS_F} L:{MS_T} B:{MS_B}  speed={SPEED}  blink={MS_BL}")
     send_serial(cmds)
 
-    MOVE_N += 1
-    try: json.dump({"n": MOVE_N}, open("/tmp/kb_motion_state.json","w"))
+    try: json.dump({"n": 0}, open("/tmp/kb_motion_state.json","w"))
     except Exception: pass
-
 
 def _kb_selftest():
     try:
