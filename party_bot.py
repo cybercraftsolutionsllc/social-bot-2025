@@ -39,9 +39,6 @@ SILENCE_S     = 0.60
 MAX_UTT_S     = 8.00
 MIN_SPEECH_S  = 0.18
 
-PROMPT = ("You are Laughbot, you are a bot replacement for Rodney Dangerfield. Reply with ONE short, clean, clever line.No lists, no bullets, no emojis, no quotes, no meta commentary "
-          "You interact with the user based on their input by returning funny one-liners, dad jokes, and anything else funny. "
-          "No pretext, no follow up. No need for fancy build up, just reply with some funny, entertaining jokes or zings based on input, or not if the input is not coherent.")
 
 # ── mic binding (single source of truth) ───────────────────────────────────────
 def _choose_input_index():
@@ -162,30 +159,90 @@ def transcribe(path16:str)->str:
     except Exception as e:
         print("[stt err]", e); return ""
 
-def plan_action(user_text:str)->dict:
-    try:
-        r = client.responses.create(
-            model=MODEL_PLAN,
-            input=[{"role":"system","content":PROMPT},
-                   {"role":"user","content":f"User said: {user_text}"}]
-        )
-        line = (getattr(r,"output_text","") or "").strip()
-    except Exception as e:
-        print("[llm err]", e); line = "Okay, let’s keep it snappy."
-    RECENT.append(line[:120])
-    return {"say": line}
 
-# ── TTS ────────────────────────────────────────────────────────────────────────
+# --- LLM rate & retry guard ---
+_LAST_LLM_AT = 0.0
+
+def plan_action(user_text: str) -> dict:
+    """
+    Calls LLM with: rate-limit, retries w/ backoff and model fallbacks.
+    Env knobs:
+      KINDERBOT_MIN_LLM_S   (default 2.5)   # min seconds between LLM calls
+      KINDERBOT_LLM         (primary model; already in your env)
+    """
+    import os, time, random, traceback
+    global _LAST_LLM_AT, client, MODEL_PLAN
+
+    min_gap = float(os.getenv("KINDERBOT_MIN_LLM_S","2.5"))
+    now = time.time()
+    gap = now - _LAST_LLM_AT
+    if gap < min_gap:
+        time.sleep(min_gap - gap)
+
+    # primary + fallbacks
+    prim = MODEL_PLAN
+    fallbacks = [m for m in [prim, "gpt-4o-mini", "gpt-4o"] if m]  # keep simple & solid
+
+    prompt = (
+        "You are a repurposed kinderbot a bot replacement for Richard Pryor. Reply with a funny, and clever joke. No lists, no bullets, no emojis, no quotes, no meta"          
+        "You interact with the user based on their input by returning funny one-liners, dad jokes, and anything else funny."
+        "No pretext, no follow up. No need for fancy build up, just reply with some funny, entertaining jokes or zings based on input, or not if the input is not coherent."
+    )
+
+    last_err = None
+    for attempt in range(4):  # up to 4 tries total
+        model = fallbacks[min(attempt, len(fallbacks)-1)]
+        try:
+            r = client.responses.create(
+                model=model,
+                input=[{"role":"system","content":prompt},
+                       {"role":"user","content":f"User said: {user_text}"}]
+            )
+            line = (getattr(r, "output_text", "") or "").strip()
+            if not line:
+                raise RuntimeError("empty output_text")
+            _LAST_LLM_AT = time.time()
+            return {"say": line}
+        except Exception as e:
+            last_err = e
+            msg = str(e)
+            # gentle backoff with jitter; treat 429/503/500 similarly
+            base = 0.4 * (2 ** attempt)
+            time.sleep(base + random.uniform(0.05, 0.25))
+    print("[llm err] giving up after retries:", last_err)
+    _LAST_LLM_AT = time.time()
+
+    # Friendly canned lines if LLM stays unhappy
+    FALLBACKS = [
+        "Timing is everything—apparently the punchline missed the bus.",
+        "Error 404: Joke not found… installing sense of humor, please wait.",
+        "Let’s pretend I said something brilliant and you laughed politely.",
+        "I’d make a UDP joke, but you might not get it.",
+    ]
+    return {"say": random.choice(FALLBACKS)}
+
+
 def say_espeak(text):
     try:
         import os, shlex, subprocess
-        dev = os.getenv("KINDERBOT_SPKR","")
-        if dev:
-            # render to stdout and send to ALSA device explicitly
-            cmd = f'espeak-ng -s 165 -p 45 --stdout {shlex.quote(text)} | aplay -q -D {shlex.quote(dev)}'
-            subprocess.run(cmd, shell=True, check=False)
-        else:
-            subprocess.run(["espeak-ng","-s","165","-p","45",text], check=False)
+        dev   = os.getenv("KINDERBOT_SPKR","")              # e.g. plughw:2,0
+        voice = os.getenv("KINDERBOT_VOICE","mb-us1")       # e.g. mb-us1 / mb-en1 / en-us
+        speed = os.getenv("KINDERBOT_TTS_SPEED","135")      # slower = more natural
+        pitch = os.getenv("KINDERBOT_TTS_PITCH","30")       # a bit lower/warmer
+
+        # Build the espeak -> aplay pipeline (or direct, if no device override)
+        def pipe(v):
+            esc = shlex.quote(text)
+            if dev:
+                return f'espeak-ng -v {v} -s {speed} -p {pitch} --stdout {esc} | aplay -q -D {shlex.quote(dev)}'
+            else:
+                return f'espeak-ng -v {v} -s {speed} -p {pitch} {esc}'
+
+        # Try requested voice; on failure, fall back to en-us
+        cmd = pipe(voice)
+        rc  = subprocess.run(cmd, shell=True).returncode
+        if rc != 0 and voice != "en-us":
+            subprocess.run(pipe("en-us"), shell=True, check=False)
     except Exception as e:
         print("[espeak warn]", e)
 
